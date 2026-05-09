@@ -1,4 +1,5 @@
 import asyncio
+import hashlib
 import json
 import os
 import html
@@ -333,6 +334,57 @@ def _normalize_route_hashes_for_path_length(
       continue
     normalized.append(item)
   return normalized if changed else list(path_hashes)
+
+
+def _route_path_signature(
+  used_hashes: Optional[List[Any]],
+  point_ids: Optional[List[Any]],
+) -> str:
+  parts: List[str] = []
+  hash_parts = [
+    str(item).strip().upper()
+    for item in (used_hashes or [])
+    if item is not None and str(item).strip()
+  ]
+  if hash_parts:
+    parts.append("h:" + "|".join(hash_parts))
+
+  point_parts = [
+    str(item).strip().upper()
+    for item in (point_ids or [])
+    if item is not None and str(item).strip()
+  ]
+  if point_parts:
+    parts.append("p:" + "|".join(point_parts))
+
+  if not parts:
+    return ""
+  return hashlib.sha1("||".join(parts).encode("utf-8")).hexdigest()[:12]
+
+
+def _route_id_for_event(
+  event: Dict[str, Any],
+  used_hashes: Optional[List[Any]],
+  point_ids: Optional[List[Any]],
+) -> str:
+  route_id = event.get("route_id")
+  if route_id:
+    return route_id
+
+  message_hash = event.get("message_hash")
+  receiver_key = event.get("receiver_id") or "observer"
+  if message_hash:
+    path_key = _route_path_signature(used_hashes, point_ids)
+    # Keep path variants for the same message/observer separate so combined
+    # feeds do not overwrite state-specific route observations.
+    if path_key:
+      return f"{message_hash}:{receiver_key}:{path_key}"
+    return f"{message_hash}:{receiver_key}"
+
+  return (
+    f"{event.get('origin_id', 'route')}:{receiver_key}:"
+    f"{int((event.get('ts') or time.time()) * 1000)}"
+  )
 
 
 def _coverage_request_url(base_url: str, api_key: str) -> str:
@@ -2311,19 +2363,7 @@ async def broadcaster():
         if outside:
           continue
 
-      route_id = event.get("route_id")
-      if not route_id:
-        message_hash = event.get("message_hash")
-        receiver_key = event.get("receiver_id") or "observer"
-        if message_hash:
-          # Keep one active line per (message, observer) so multi-observer
-          # receptions do not overwrite each other.
-          route_id = f"{message_hash}:{receiver_key}"
-        else:
-          route_id = (
-            f"{event.get('origin_id', 'route')}:{receiver_key}:"
-            f"{int((event.get('ts') or time.time()) * 1000)}"
-          )
+      route_id = _route_id_for_event(event, used_hashes, point_ids)
       expires_at = (event.get("ts") or time.time()) + ROUTE_TTL_SECONDS
       route = {
         "id": route_id,

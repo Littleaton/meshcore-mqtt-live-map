@@ -329,3 +329,56 @@ def test_route_event_prefers_packet_hash_for_route_identity(monkeypatch):
   route_events = [event for event in queue.events if event.get("type") == "route"]
   assert route_events
   assert route_events[0]["message_hash"] == "7232623D62E7848D"
+
+
+def test_route_identity_keeps_distinct_paths_for_same_message_receiver():
+  event = {
+    "message_hash": "7232623D62E7848D",
+    "receiver_id": "DD001111",
+  }
+
+  short_route_id = app._route_id_for_event(
+    event,
+    ["E3", "FC", "86", "F0", "D2"],
+    ["E3001111", "FC002222", "86003333", "F0004444", "D2005555"],
+  )
+  long_route_id = app._route_id_for_event(
+    event,
+    ["12", "E3", "7F", "79", "FC", "86", "67", "22", "F0", "D2"],
+    [
+      "12001111",
+      "E3001111",
+      "7F002222",
+      "79003333",
+      "FC004444",
+      "86005555",
+      "67006666",
+      "22007777",
+      "F0008888",
+      "D2009999",
+    ],
+  )
+
+  assert short_route_id != long_route_id
+  assert short_route_id.startswith("7232623D62E7848D:DD001111:")
+  assert long_route_id.startswith("7232623D62E7848D:DD001111:")
+
+
+def test_route_identity_includes_resolved_points_for_ambiguous_hashes():
+  event = {
+    "message_hash": "7232623D62E7848D",
+    "receiver_id": "DD001111",
+  }
+
+  first_route_id = app._route_id_for_event(
+    event,
+    ["DF", "9B", "67", "EE"],
+    ["DF557D0E", "9B26CF0E", "67D954E5", "EEB01243"],
+  )
+  second_route_id = app._route_id_for_event(
+    event,
+    ["DF", "9B", "67", "EE"],
+    ["DF557D0E", "9B1D7AD2", "67D954E5", "EEB01243"],
+  )
+
+  assert first_route_id != second_route_id
