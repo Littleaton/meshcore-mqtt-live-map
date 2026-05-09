@@ -14,6 +14,7 @@ def clear_runtime_state():
   state.node_hash_collisions.clear()
   state.node_hash_to_device.clear()
   state.neighbor_edges.clear()
+  state.peer_history_pairs.clear()
   yield
   state.devices.clear()
   state.seen_devices.clear()
@@ -21,6 +22,7 @@ def clear_runtime_state():
   state.node_hash_collisions.clear()
   state.node_hash_to_device.clear()
   state.neighbor_edges.clear()
+  state.peer_history_pairs.clear()
 
 
 def _add_device(device_id, lat, lon, role="repeater"):
@@ -209,6 +211,37 @@ def test_ambiguous_one_byte_hashes_resolve_as_plausible_path_without_origin():
   assert points is not None
   assert used_hashes == ["AB", "BC", "CD"]
   assert point_ids == ["ABCD1111", "BC001111", "CD001111"]
+
+
+def test_persisted_peer_history_can_override_shortest_ambiguous_path():
+  _add_device("AA001111", 42.0000, -71.0000, role="repeater")
+  _add_device("AB111111", 42.0002, -71.0002, role="repeater")
+  _add_device("AB222222", 42.0500, -71.0500, role="repeater")
+  _add_device("BC001111", 42.0600, -71.0600, role="repeater")
+  decoder._rebuild_node_hash_map()
+  state.peer_history_pairs["AA001111|AB222222"] = {
+    "a_id": "AA001111",
+    "b_id": "AB222222",
+    "buckets": {str(int(time.time())): 40},
+    "last_ts": time.time(),
+  }
+  state.peer_history_pairs["AB222222|BC001111"] = {
+    "a_id": "AB222222",
+    "b_id": "BC001111",
+    "buckets": {str(int(time.time())): 40},
+    "last_ts": time.time(),
+  }
+
+  points, used_hashes, point_ids = decoder._route_points_from_hashes(
+    path_hashes=["AA", "AB", "BC"],
+    origin_id=None,
+    receiver_id=None,
+    ts=time.time(),
+  )
+
+  assert points is not None
+  assert used_hashes == ["AA", "AB", "BC"]
+  assert point_ids == ["AA001111", "AB222222", "BC001111"]
 
 
 def test_ambiguous_one_byte_hash_with_neighbor_evidence_is_kept():

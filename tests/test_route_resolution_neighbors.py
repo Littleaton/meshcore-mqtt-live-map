@@ -22,6 +22,7 @@ def _clear_state():
   state.node_hash_collisions.clear()
   state.node_hash_to_device.clear()
   state.neighbor_edges.clear()
+  state.peer_history_pairs.clear()
 
 
 def test_neighbor_edges_preferred_for_collided_hash_after_first_hop():

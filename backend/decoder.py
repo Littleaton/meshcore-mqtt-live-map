@@ -33,6 +33,7 @@ from state import (
   node_hash_collisions,
   node_hash_to_device,
   neighbor_edges,
+  peer_history_pairs,
   seen_devices,
 )
 from los import _haversine_m
@@ -503,7 +504,9 @@ def _choose_neighbor_device(
     manual = bool(edge.get("manual"))
     auto = bool(edge.get("auto"))
     count = int(edge.get("count", 0) or 0)
-    last_seen = float(edge.get("last_seen", 0.0) or 0.0)
+    peer_count, peer_last_seen = _peer_history_stats(prev_id, device_id)
+    count += peer_count
+    last_seen = max(float(edge.get("last_seen", 0.0) or 0.0), peer_last_seen)
     priority = 2 if manual else (1 if auto else 0)
     score = (priority, count, last_seen)
     if best_score is None or score > best_score:
@@ -556,6 +559,35 @@ def _route_recency_penalty(device_id: str, ts: float) -> float:
   return min(delta, 3600.0) * 0.05
 
 
+def _peer_history_stats(a_id: Optional[str], b_id: Optional[str]) -> Tuple[int, float]:
+  if not a_id or not b_id or a_id == b_id:
+    return (0, 0.0)
+  best_count = 0
+  best_last_ts = 0.0
+  for key in (f"{a_id}|{b_id}", f"{b_id}|{a_id}"):
+    entry = peer_history_pairs.get(key)
+    if not isinstance(entry, dict):
+      continue
+    buckets = entry.get("buckets")
+    if isinstance(buckets, dict):
+      count = 0
+      for value in buckets.values():
+        try:
+          count += int(value)
+        except (TypeError, ValueError):
+          continue
+    else:
+      count = 0
+    try:
+      last_ts = float(entry.get("last_ts", 0.0) or 0.0)
+    except (TypeError, ValueError):
+      last_ts = 0.0
+    if count > best_count or (count == best_count and last_ts > best_last_ts):
+      best_count = count
+      best_last_ts = last_ts
+  return (best_count, best_last_ts)
+
+
 def _route_transition_score(
   prev_id: Optional[str],
   prev_lat: float,
@@ -575,6 +607,9 @@ def _route_transition_score(
       score -= 5000.0
     count = int(edge.get("count", 0) or 0)
     score -= min(count, 10) * 500.0
+  peer_count, _peer_last_ts = _peer_history_stats(prev_id, device_id)
+  if peer_count:
+    score -= min(peer_count, 50) * 1000.0
   return score
 
 
