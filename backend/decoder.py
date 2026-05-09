@@ -513,6 +513,187 @@ def _choose_neighbor_device(
   return best_id
 
 
+def _route_candidate(device_id: str) -> Optional[Tuple[float, float]]:
+  state = devices.get(device_id)
+  if not state:
+    return None
+
+  if ROUTE_INFRA_ONLY and (
+    not state.role or state.role not in ("repeater", "room")
+  ):
+    return None
+
+  if _coords_are_zero(state.lat, state.lon):
+    return None
+
+  try:
+    return (float(state.lat), float(state.lon))
+  except (TypeError, ValueError):
+    return None
+
+
+def _route_anchor(device_id: Optional[str]) -> Optional[Tuple[float, float]]:
+  if not device_id:
+    return None
+  state = devices.get(device_id)
+  if not state or _coords_are_zero(state.lat, state.lon):
+    return None
+  try:
+    return (float(state.lat), float(state.lon))
+  except (TypeError, ValueError):
+    return None
+
+
+def _route_recency_penalty(device_id: str, ts: float) -> float:
+  state = devices.get(device_id)
+  if not state:
+    return 0.0
+  last_seen = seen_devices.get(device_id) or state.ts or 0.0
+  try:
+    delta = abs(float(last_seen) - float(ts))
+  except (TypeError, ValueError):
+    return 0.0
+  return min(delta, 3600.0) * 0.05
+
+
+def _route_transition_score(
+  prev_id: Optional[str],
+  prev_lat: float,
+  prev_lon: float,
+  device_id: str,
+  lat: float,
+  lon: float,
+) -> Optional[float]:
+  dist = _haversine_m(prev_lat, prev_lon, lat, lon)
+  if dist > (ROUTE_MAX_HOP_DISTANCE * 1000.0):
+    return None
+
+  score = dist
+  edge = neighbor_edges.get(prev_id, {}).get(device_id) if prev_id else None
+  if edge:
+    if edge.get("manual"):
+      score -= 5000.0
+    count = int(edge.get("count", 0) or 0)
+    score -= min(count, 10) * 500.0
+  return score
+
+
+def _allow_single_hash_resolution(node_hash: str) -> bool:
+  candidates = node_hash_candidates.get(node_hash) or []
+  return (
+    len(node_hash) != 2 or len(candidates) <= 1 or
+    ROUTE_ALLOW_AMBIGUOUS_ONE_BYTE_FALLBACK
+  )
+
+
+def _resolve_hash_path(
+  normalized: List[str],
+  origin_id: Optional[str],
+  ts: float,
+) -> Tuple[List[List[float]], List[str], List[Optional[str]]]:
+  options: List[Tuple[int, str, List[Tuple[str, float, float]]]] = []
+  for idx, key in enumerate(normalized):
+    candidates: List[Tuple[str, float, float]] = []
+    for device_id in node_hash_candidates.get(key) or []:
+      coords = _route_candidate(device_id)
+      if not coords:
+        continue
+      lat, lon = coords
+      candidates.append((device_id, lat, lon))
+    if candidates:
+      options.append((idx, key, candidates))
+
+  if not options:
+    return [], [], []
+
+  origin_anchor = _route_anchor(origin_id)
+  max_skip_penalty = ROUTE_MAX_HOP_DISTANCE * 1000.0
+  states: Dict[Tuple[int, str], Dict[str, Any]] = {}
+
+  for option_pos, (hash_idx, key, candidates) in enumerate(options):
+    for device_id, lat, lon in candidates:
+      best: Optional[Dict[str, Any]] = None
+
+      start_score = _route_recency_penalty(device_id, ts)
+      if origin_anchor:
+        anchor_score = _route_transition_score(
+          origin_id,
+          origin_anchor[0],
+          origin_anchor[1],
+          device_id,
+          lat,
+          lon,
+        )
+        if anchor_score is None:
+          continue
+        start_score += anchor_score
+
+      best = {
+        "score": start_score,
+        "ids": [device_id],
+        "hashes": [key],
+        "points": [[lat, lon]],
+        "last_index": hash_idx,
+      }
+
+      for prev_pos in range(option_pos):
+        prev_idx, _prev_key, prev_candidates = options[prev_pos]
+        skipped_hashes = max(0, hash_idx - prev_idx - 1)
+        skip_penalty = min(skipped_hashes * 250.0, max_skip_penalty)
+        for prev_id, prev_lat, prev_lon in prev_candidates:
+          prev_state = states.get((prev_idx, prev_id))
+          if not prev_state:
+            continue
+          if device_id in prev_state["ids"]:
+            continue
+          transition = _route_transition_score(
+            prev_id, prev_lat, prev_lon, device_id, lat, lon
+          )
+          if transition is None:
+            continue
+          score = prev_state["score"] + transition + skip_penalty
+          candidate_state = {
+            "score": score,
+            "ids": prev_state["ids"] + [device_id],
+            "hashes": prev_state["hashes"] + [key],
+            "points": prev_state["points"] + [[lat, lon]],
+            "last_index": hash_idx,
+          }
+          if (
+            best is None or
+            len(candidate_state["ids"]) > len(best["ids"]) or
+            (
+              len(candidate_state["ids"]) == len(best["ids"]) and
+              candidate_state["score"] < best["score"]
+            )
+          ):
+            best = candidate_state
+
+      if best is not None:
+        states[(hash_idx, device_id)] = best
+
+  best_state: Optional[Dict[str, Any]] = None
+  for state in states.values():
+    if len(state["ids"]) < 2 and not _allow_single_hash_resolution(
+      state["hashes"][0]
+    ):
+      continue
+    if (
+      best_state is None or
+      len(state["ids"]) > len(best_state["ids"]) or
+      (
+        len(state["ids"]) == len(best_state["ids"]) and
+        state["score"] < best_state["score"]
+      )
+    ):
+      best_state = state
+
+  if not best_state:
+    return [], [], []
+
+  return best_state["points"], best_state["hashes"], best_state["ids"]
+
+
 def _route_points_from_hashes(
   path_hashes: List[Any],
   origin_id: Optional[str],
@@ -541,107 +722,9 @@ def _route_points_from_hashes(
     if normalized[-1] in origin_hashes and normalized[0] not in origin_hashes:
       normalized.reverse()
 
-  points: List[List[float]] = []
-  used_hashes: List[str] = []
-  point_ids: List[Optional[str]] = []
-
-  # We need a reference point to start "walking" the path spatially.
-  # Best bet is the origin, if known.
-  current_lat = None
-  current_lon = None
-  current_id: Optional[str] = None
-
-  if origin_id:
-    origin_state = devices.get(origin_id)
-    if origin_state and not _coords_are_zero(
-      origin_state.lat, origin_state.lon
-    ):
-      try:
-        current_lat = float(origin_state.lat)
-        current_lon = float(origin_state.lon)
-        current_id = origin_id
-      except (TypeError, ValueError):
-        pass
-
-  # Build the path
-  for key in normalized:
-    device_id = None
-    candidates = node_hash_candidates.get(key) or []
-    ambiguous_single_byte = (
-      len(key) == 2 and len(candidates) > 1 and
-      not ROUTE_ALLOW_AMBIGUOUS_ONE_BYTE_FALLBACK
-    )
-
-    if current_id and current_lat is not None and current_lon is not None:
-      if len(candidates) > 1:
-        # For the first hop, prefer the closest candidate to the origin.
-        if not points and not ambiguous_single_byte:
-          device_id = _choose_closest_device(key, current_lat, current_lon, ts)
-        if not device_id:
-          neighbor_id = _choose_neighbor_device(
-            current_id,
-            candidates,
-            current_lat,
-            current_lon,
-            ts,
-          )
-          if neighbor_id:
-            device_id = neighbor_id
-            edge = neighbor_edges.get(current_id, {}).get(neighbor_id, {})
-            manual = " manual" if edge.get("manual") else ""
-            print(
-              f"[route] neighbor pick{manual} hash={key} {current_id[:8]} -> {neighbor_id[:8]}"
-            )
-
-    # If we have a location fix, try to find the "closest" candidate for this hash
-    if (
-      not device_id and
-      current_lat is not None and
-      current_lon is not None and
-      not ambiguous_single_byte
-    ):
-      device_id = _choose_closest_device(key, current_lat, current_lon, ts)
-
-    if not device_id and not ambiguous_single_byte:
-      # Fallback to older time-based logic or just picking first valid
-      device_id = _choose_device_for_hash(key, ts)
-      if not device_id:
-        # fallback: just pick *any* mapping if available
-        device_id = node_hash_to_device.get(key)
-
-    if not device_id:
-      continue
-
-    state = devices.get(device_id)
-    if not state:
-      continue
-    if _coords_are_zero(state.lat, state.lon):
-      continue
-
-    try:
-      p_lat = float(state.lat)
-      p_lon = float(state.lon)
-    except (TypeError, ValueError):
-      continue
-
-    # Safety check: enforce max distance even for fallback selections
-    if current_lat is not None and current_lon is not None:
-      dist = _haversine_m(current_lat, current_lon, p_lat, p_lon)
-      if dist > (ROUTE_MAX_HOP_DISTANCE * 1000.0):
-        continue
-
-    point = [p_lat, p_lon]
-    # Update our "current" reference for the next hop
-    current_lat = p_lat
-    current_lon = p_lon
-    current_id = device_id
-
-    if points and point == points[-1]:
-      continue
-
-    points.append(point)
-    used_hashes.append(key)
-    point_ids.append(device_id)
+  points, used_hashes, point_ids = _resolve_hash_path(
+    normalized, origin_id, ts
+  )
 
   # Prepend origin if missing
   origin_point = None

@@ -192,6 +192,25 @@ def test_ambiguous_one_byte_hash_without_neighbor_is_skipped():
   assert point_ids == ["AA001111", "DD001111"]
 
 
+def test_ambiguous_one_byte_hashes_resolve_as_plausible_path_without_origin():
+  _add_device("ABCD1111", 42.0000, -71.0000, role="repeater")
+  _add_device("ABEF1111", 45.0000, -74.0000, role="repeater")
+  _add_device("BC001111", 42.0002, -71.0002, role="repeater")
+  _add_device("CD001111", 42.0004, -71.0004, role="repeater")
+  decoder._rebuild_node_hash_map()
+
+  points, used_hashes, point_ids = decoder._route_points_from_hashes(
+    path_hashes=["AB", "BC", "CD"],
+    origin_id=None,
+    receiver_id=None,
+    ts=time.time(),
+  )
+
+  assert points is not None
+  assert used_hashes == ["AB", "BC", "CD"]
+  assert point_ids == ["ABCD1111", "BC001111", "CD001111"]
+
+
 def test_ambiguous_one_byte_hash_with_neighbor_evidence_is_kept():
   _add_device("AA001111", 42.0000, -71.0000, role="repeater")
   _add_device("BC001111", 42.0002, -71.0002, role="repeater")
